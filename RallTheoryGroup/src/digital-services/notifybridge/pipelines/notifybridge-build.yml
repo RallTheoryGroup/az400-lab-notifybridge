@@ -1,0 +1,43 @@
+# Lab 19 Step 5: NotifyBridge build with chat notification of the build outcome
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - RallTheoryGroup/src/digital-services/notifybridge/src
+    - RallTheoryGroup/src/digital-services/notifybridge/pipelines/notifybridge-build.yml
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+- job: build
+  displayName: Build NotifyBridge
+  steps:
+  - checkout: self
+
+  - task: UseDotNet@2
+    displayName: Use .NET 8 SDK
+    inputs:
+      packageType: sdk
+      version: 8.0.x
+
+  - script: dotnet build RallTheoryGroup/src/digital-services/notifybridge/src/NotifyBridge.csproj --configuration Release
+    displayName: Build NotifyBridge (Release)
+
+  - task: PowerShell@2
+    displayName: Notify build outcome
+    condition: always()
+    env:
+      WEBHOOK_URL: $(WEBHOOK_URL)
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        $ErrorActionPreference = 'Stop'
+        if (-not $env:WEBHOOK_URL) { throw 'WEBHOOK_URL is not configured.' }
+        $runUrl = "$env:SYSTEM_COLLECTIONURI$env:SYSTEM_TEAMPROJECTID/_build/results?buildId=$env:BUILD_BUILDID"
+        $body = @{ text = "NotifyBridge: $env:AGENT_JOBSTATUS. Investigate: $runUrl" } | ConvertTo-Json
+        Invoke-RestMethod -Method Post -Uri $env:WEBHOOK_URL -ContentType 'application/json' -Body $body

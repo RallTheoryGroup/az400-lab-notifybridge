@@ -1,0 +1,77 @@
+# Lab 19 (Chapter 18 pattern): NotifyBridge sandbox deployment with deployment-outcome telemetry (Logs Ingestion API)
+trigger: none
+pr: none
+
+parameters:
+- name: webAppName
+  displayName: Target web app (override only for the deliberate failed-deployment test)
+  type: string
+  default: app-notifybridge-ch19-rtg
+
+variables:
+  resourceGroup: rg-notifybridge-lab-ch19
+  # Non-secret values observed in the Chapter 18 DCR JSON view
+  logsIngestionEndpoint: https://dcr-deployment-telemetry-53ty-eastus.logs.z1.ingest.monitor.azure.com
+  dcrImmutableId: dcr-2b81535d6f604706b0346ed5af2ddeb8
+  deploymentStream: Custom-DeploymentTelemetry_CL
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+- job: deploy_staging
+  displayName: Build and deploy NotifyBridge (staging)
+  steps:
+  - checkout: self
+
+  - task: UseDotNet@2
+    displayName: Use .NET 8 SDK
+    inputs:
+      packageType: sdk
+      version: 8.0.x
+
+  - script: |
+      set -euo pipefail
+      dotnet publish RallTheoryGroup/src/digital-services/notifybridge/src/NotifyBridge.csproj -c Release -o "$(Build.ArtifactStagingDirectory)/publish"
+      cd "$(Build.ArtifactStagingDirectory)/publish"
+      zip -qr "$(Build.ArtifactStagingDirectory)/notifybridge.zip" .
+    displayName: Publish and package NotifyBridge
+
+  - task: AzureCLI@2
+    displayName: Deploy NotifyBridge to App Service
+    inputs:
+      azureSubscription: ledgerflow-wif
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        az webapp deploy --name "${{ parameters.webAppName }}" --resource-group "$(resourceGroup)" \
+          --src-path "$(Build.ArtifactStagingDirectory)/notifybridge.zip" --type zip --output none
+        curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 10 --max-time 20 \
+          "https://${{ parameters.webAppName }}.azurewebsites.net/health"
+
+  - task: AzureCLI@2
+    displayName: Record deployment outcome
+    condition: always()
+    inputs:
+      azureSubscription: ledgerflow-wif
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $ErrorActionPreference = 'Stop'
+        $token = az account get-access-token --resource https://monitor.azure.com/ --query accessToken -o tsv
+        if ($LASTEXITCODE -ne 0 -or -not $token) { throw 'Cannot obtain ingestion token.' }
+        $record = @{
+          TimeGenerated = [DateTime]::UtcNow.ToString('o')
+          Application = 'NotifyBridge'
+          Environment = 'staging'
+          RunId = $env:BUILD_BUILDID
+          CommitId = $env:BUILD_SOURCEVERSION
+          Status = $env:AGENT_JOBSTATUS
+        }
+        $body = ConvertTo-Json -InputObject @($record) -Compress
+        $uri = "$(logsIngestionEndpoint)".TrimEnd('/') +
+          "/dataCollectionRules/$(dcrImmutableId)/streams/$(deploymentStream)?api-version=2023-01-01"
+        Invoke-RestMethod -Method Post -Uri $uri `
+          -Headers @{ Authorization = ('Bearer ' + $token) } `
+          -ContentType 'application/json' -Body $body

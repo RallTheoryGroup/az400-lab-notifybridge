@@ -1,0 +1,44 @@
+# Lab 19 Step 5: trusted push/manual build workflow (minimal Chapter 9 equivalent) with chat notification
+name: NotifyBridge build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - RallTheoryGroup/src/digital-services/notifybridge/src/**
+      - .github/workflows/notifybridge-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build NotifyBridge (Release)
+        run: dotnet build RallTheoryGroup/src/digital-services/notifybridge/src/NotifyBridge.csproj --configuration Release
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    permissions: {}
+    steps:
+      - name: Post build result
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          RESULT: ${{ needs.build.result }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$WEBHOOK_URL" || { echo "WEBHOOK_URL is not configured"; exit 1; }
+          payload=$(jq -n --arg text "NotifyBridge: $RESULT on $BRANCH. Investigate: $RUN_URL" '{text:$text}')
+          curl --fail-with-body --silent --show-error --connect-timeout 10 --max-time 30 \
+            -H 'Content-Type: application/json' --data "$payload" "$WEBHOOK_URL"
