@@ -1,0 +1,67 @@
+# Lab 19 Step 6: promotion gated on the Azure Monitor alert *monitor condition* (Alerts Management API)
+name: NotifyBridge promotion gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  alert-gate:
+    runs-on: ubuntu-latest
+    # Protected configuration: the gate identity and ALERT_TARGET_IDS are environment secrets (main only)
+    environment: notifybridge-alert-gate
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Block promotion on fired Sev0/Sev1 alerts
+        shell: pwsh
+        env:
+          ALERT_TARGET_IDS: ${{ secrets.ALERT_TARGET_IDS }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $subscription = az account show --query id -o tsv
+          if ($LASTEXITCODE -ne 0 -or -not $subscription) { throw 'Azure authentication failed.' }
+          $targets = @($env:ALERT_TARGET_IDS | ConvertFrom-Json)
+          if ($targets.Count -eq 0 -or @($targets | Where-Object {
+              $_ -isnot [string] -or $_ -notlike '/subscriptions/*'
+          }).Count -gt 0) { throw 'Configure valid protected alert resource IDs.' }
+          $uri = "https://management.azure.com/subscriptions/$subscription/providers/Microsoft.AlertsManagement/alerts?api-version=2019-03-01&monitorCondition=Fired"
+          $blocking = @()
+          do {
+              $json = az rest --method get --url $uri -o json
+              if ($LASTEXITCODE -ne 0) { throw 'Alert query failed; promotion blocked.' }
+              $page = $json | ConvertFrom-Json
+              if ($null -eq $page.value) { throw 'Unexpected alert response; promotion blocked.' }
+              $blocking += @($page.value | Where-Object {
+                  $e = $_.properties.essentials
+                  if ($null -eq $e -or [string]::IsNullOrWhiteSpace($e.targetResource) -or
+                      $e.monitorCondition -notin @('Fired', 'Resolved') -or
+                      $e.severity -notin @('Sev0', 'Sev1', 'Sev2', 'Sev3', 'Sev4')) {
+                      throw 'Malformed alert record; promotion blocked.'
+                  }
+                  $matches = $e.targetResource -in $targets
+                  $matches -and $e.monitorCondition -eq 'Fired' -and $e.severity -in @('Sev0', 'Sev1')
+              })
+              $uri = $page.nextLink
+          } while ($uri)
+          if ($blocking.Count -gt 0) { throw "$($blocking.Count) critical/error alerts block promotion." }
+          Write-Host 'No matching fired critical/error alerts.'
+
+  promote:
+    needs: alert-gate
+    runs-on: ubuntu-latest
+    environment: notifybridge-production
+    steps:
+      - name: Promote NotifyBridge (lab stand-in for the production deployment)
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 20 https://app-notifybridge-ch19-rtg.azurewebsites.net/health
+          echo "Alert gate passed; promotion of ${{ github.sha }} may proceed."
